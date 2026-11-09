@@ -77,7 +77,7 @@ import asyncio
 import logging
 import time as _time
 import uuid
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
@@ -714,10 +714,14 @@ class SyncEngine:
         for a finished sleep. A finished sleep this device ended (its own end update is in this
         device's log, whatever other devices edited since) is returned as is with nothing posted,
         so a retry after a write that landed late, or a second call racing the first, is safe.
+
+        ``object_id`` can be in either case: a sleep started on an Android phone has a lowercase
+        id and one from iOS an uppercase id, and the update is posted under the id the record
+        already has.
         """
-        object_id = object_id.upper()
         async with self._lock:
             self._check_can_write(target)
+            object_id = self._resolve_id(object_id, self._records, self._tombstones)
             sleep, ended = self._endable(object_id)
             if ended:
                 return sleep
@@ -761,6 +765,23 @@ class SyncEngine:
             return record, True
         raise TimerNotRunningError(f"sleep {object_id} isn't running")
 
+    def _resolve_id(self, object_id: str, *held: Collection[str]) -> str:
+        """The id the engine holds for ``object_id``, whatever its case.
+
+        Android writes lowercase UUIDs and iOS uppercase ones, and records are kept under the id
+        exactly as received, so an id a caller passes can differ from the stored one only in
+        case. An exact match wins. Otherwise the first stored id that is equal when upper-cased
+        is returned. An id none of ``held`` has comes back unchanged.
+        """
+        if any(object_id in ids for ids in held):
+            return object_id
+        wanted = object_id.upper()
+        for ids in held:
+            for stored in ids:
+                if stored.upper() == wanted:
+                    return stored
+        return object_id
+
     async def _add[R: Record](
         self,
         target: WriteTarget,
@@ -770,8 +791,6 @@ class SyncEngine:
     ) -> R:
         """The shared write path of every add: number, post, confirm, apply. ``baby_id`` is
         ``None`` for a record that belongs to the account, not a baby (a pump)."""
-        if object_id is not None:
-            object_id = object_id.upper()
         async with self._lock:
             self._check_can_write(target)
             baby = None
@@ -785,6 +804,11 @@ class SyncEngine:
                 # so a write that waited behind a sync posts the current ones.
                 draft = draft()
             if object_id is not None:
+                # An id the engine already holds keeps the case it has; a new one is written in
+                # uppercase, like the ids the library generates.
+                held = self._resolve_id(object_id, self._created, self._records, self._tombstones)
+                known = held in self._created or held in self._records or held in self._tombstones
+                object_id = held if known else held.upper()
                 if object_id in self._created:
                     existing = self._records.get(object_id)
                     if isinstance(existing, draft.record_type):
@@ -810,6 +834,7 @@ class SyncEngine:
         """
         async with self._lock:
             self._check_can_write(target)
+            object_id = self._resolve_id(object_id, self._created, self._records)
             if object_id not in self._created:
                 raise NotOwnRecordError(f"record {object_id} wasn't created by this device")
             if object_id not in self._records:
